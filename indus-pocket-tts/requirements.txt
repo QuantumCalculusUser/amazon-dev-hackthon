@@ -1,0 +1,5 @@
+# 1. CPU-only PyTorch (skips the multi-GB CUDA build):
+#      pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 2. Kyutai's pocket-tts, pinned to the public commit these weights were validated on.
+#    PyPI 3.1.0 also runs, but generates slightly longer, lower-rated audio with this model.
+pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts@0c2db3b

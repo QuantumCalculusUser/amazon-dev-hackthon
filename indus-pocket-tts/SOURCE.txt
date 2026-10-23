@@ -1,0 +1,2 @@
+student checkpoint: /root/pocket_tts_eval/repo/runs/inaya_distill_6l_v6/checkpoint_00100000.pt
+encoder tensors zeroed: 42
