@@ -1,11 +1,15 @@
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-import json, urllib.request, urllib.error, os, subprocess, tempfile
+import json, urllib.request, urllib.error, os, subprocess, tempfile, re
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = "qwen2.5:7b"
 VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "vosk-model-small-en-us-0.15")
+MCP_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Maitri_MCP_Starter")
+MCP_SERVER_PATH = os.path.join(MCP_FOLDER, "maitri_mcp_server.py")
+MCP_PYTHON = os.path.join(MCP_FOLDER, ".venv", "Scripts", "python.exe")
+MCP_BRIDGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maitri_mcp_bridge.py")
 SYSTEM_PROMPT = ("You are Maitri, a helpful desktop assistant. Understand English, Hindi, and Hinglish. "
                 "Reply naturally in the language the user uses. Be concise unless asked for detail.")
 
@@ -192,8 +196,92 @@ class MaitriApp:
         self.status.config(text="Maitri is thinking…",fg="#fbbf24")
         threading.Thread(target=self.ask_ollama,daemon=True).start()
 
+    def detect_mcp_command(self, text):
+        """Map clear, simple user commands to local MCP tools."""
+        s = text.strip().lower()
+
+        # Current time/date
+        if any(phrase in s for phrase in [
+            "what time is it", "current time", "tell me the time",
+            "what's the time", "what is the time", "date and time",
+            "time kya hai", "kitne baje", "abhi time"
+        ]):
+            return "get_current_time", {}
+
+        # List tasks
+        if any(phrase in s for phrase in [
+            "list my tasks", "show my tasks", "show study tasks",
+            "list study tasks", "what are my tasks", "my study tasks",
+            "mere tasks", "meri tasks", "task dikhao", "tasks dikhao"
+        ]):
+            include_done = "completed" in s or "all tasks" in s
+            return "list_study_tasks", {"include_completed": include_done}
+
+        # Complete task by ID
+        match = re.search(r"(?:complete|finish|mark done|done with|complete task)\s*(?:task\s*)?#?\s*(\d+)", s)
+        if match:
+            return "complete_study_task", {"task_id": int(match.group(1))}
+
+        # Add task. Keep extraction intentionally simple and predictable.
+        add_patterns = [
+            r"^(?:maitri[, ]+)?(?:add|create|save) (?:a )?(?:study )?task(?: to)?\s+(.+)$",
+            r"^(?:maitri[, ]+)?remind me to\s+(.+)$",
+            r"^(?:maitri[, ]+)?add task\s*:\s*(.+)$",
+            r"^(?:maitri[, ]+)?study task\s*:\s*(.+)$",
+        ]
+        for pattern in add_patterns:
+            match = re.match(pattern, text.strip(), flags=re.IGNORECASE)
+            if match:
+                detail = match.group(1).strip()
+                due = ""
+                due_match = re.search(r"\s+(?:at|by|due)\s+(.+)$", detail, flags=re.IGNORECASE)
+                if due_match:
+                    due = due_match.group(1).strip()
+                    detail = detail[:due_match.start()].strip()
+                if detail:
+                    return "add_study_task", {"title": detail, "due": due}
+
+        return None
+
+    def call_mcp_tool(self, tool_name, arguments):
+        """Call the MCP bridge in the isolated MCP virtual environment."""
+        if not os.path.isfile(MCP_SERVER_PATH):
+            raise FileNotFoundError(
+                "MCP server not found. Copy your Maitri_MCP_Starter folder beside app.py."
+            )
+        if not os.path.isfile(MCP_PYTHON):
+            raise FileNotFoundError(
+                "MCP virtual environment not found. Expected .venv\\\\Scripts\\\\python.exe "
+                "inside the Maitri_MCP_Starter folder."
+            )
+        if not os.path.isfile(MCP_BRIDGE_PATH):
+            raise FileNotFoundError("maitri_mcp_bridge.py must be beside app.py.")
+        completed = subprocess.run(
+            [MCP_PYTHON, MCP_BRIDGE_PATH, tool_name, json.dumps(arguments, ensure_ascii=False)],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "Unknown MCP error").strip()
+            raise RuntimeError(detail)
+        return completed.stdout.strip()
+
     def ask_ollama(self):
         try:
+            user_text = self.messages[-1].get("content", "") if self.messages else ""
+            tool_request = self.detect_mcp_command(user_text)
+            if tool_request:
+                tool_name, arguments = tool_request
+                answer = self.call_mcp_tool(tool_name, arguments)
+                self.messages.append({"role": "assistant", "content": answer})
+                self.root.after(0, lambda a=answer: self.add_line("Maitri", a))
+                self.root.after(0, lambda: self.status.config(text="MCP tool completed", fg="#86efac"))
+                if self.speech_enabled.get():
+                    self.speak(answer)
+                return
+
             payload=json.dumps({"model":MODEL,"messages":self.messages,"stream":False}).encode()
             req=urllib.request.Request(OLLAMA_URL,data=payload,headers={"Content-Type":"application/json"},method="POST")
             with urllib.request.urlopen(req,timeout=180) as r: result=json.loads(r.read().decode())
