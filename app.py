@@ -6,10 +6,17 @@ import json, urllib.request, urllib.error, os, subprocess, tempfile, re
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = "qwen2.5:7b"
 VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "vosk-model-small-en-us-0.15")
-MCP_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Maitri_MCP_Starter")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# Support both layouts: MCP files directly beside app.py, or in a subfolder.
+_NESTED_MCP_FOLDER = os.path.join(APP_DIR, "Maitri_MCP_Starter")
+MCP_FOLDER = (
+    _NESTED_MCP_FOLDER
+    if os.path.isfile(os.path.join(_NESTED_MCP_FOLDER, "maitri_mcp_server.py"))
+    else APP_DIR
+)
 MCP_SERVER_PATH = os.path.join(MCP_FOLDER, "maitri_mcp_server.py")
 MCP_PYTHON = os.path.join(MCP_FOLDER, ".venv", "Scripts", "python.exe")
-MCP_BRIDGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maitri_mcp_bridge.py")
+MCP_BRIDGE_PATH = os.path.join(APP_DIR, "maitri_mcp_bridge.py")
 SYSTEM_PROMPT = ("You are Maitri, a helpful desktop assistant. Understand English, Hindi, and Hinglish. "
                 "Reply naturally in the language the user uses. Be concise unless asked for detail.")
 
@@ -197,34 +204,36 @@ class MaitriApp:
         threading.Thread(target=self.ask_ollama,daemon=True).start()
 
     def detect_mcp_command(self, text):
-        """Map clear, simple user commands to local MCP tools."""
+        """Recognize a small set of explicit local-tool commands."""
         s = text.strip().lower()
 
-        # Current time/date
-        if any(phrase in s for phrase in [
+        time_phrases = [
             "what time is it", "current time", "tell me the time",
             "what's the time", "what is the time", "date and time",
             "time kya hai", "kitne baje", "abhi time"
-        ]):
+        ]
+        if any(p in s for p in time_phrases):
             return "get_current_time", {}
 
-        # List tasks
-        if any(phrase in s for phrase in [
+        task_list_phrases = [
             "list my tasks", "show my tasks", "show study tasks",
             "list study tasks", "what are my tasks", "my study tasks",
             "mere tasks", "meri tasks", "task dikhao", "tasks dikhao"
-        ]):
-            include_done = "completed" in s or "all tasks" in s
-            return "list_study_tasks", {"include_completed": include_done}
+        ]
+        if any(p in s for p in task_list_phrases):
+            return "list_study_tasks", {
+                "include_completed": ("completed" in s or "all tasks" in s)
+            }
 
-        # Complete task by ID
-        match = re.search(r"(?:complete|finish|mark done|done with|complete task)\s*(?:task\s*)?#?\s*(\d+)", s)
+        match = re.search(
+            r"(?:complete|finish|mark done|done with)\s*(?:task\s*)?#?\s*(\d+)",
+            s
+        )
         if match:
             return "complete_study_task", {"task_id": int(match.group(1))}
 
-        # Add task. Keep extraction intentionally simple and predictable.
         add_patterns = [
-            r"^(?:maitri[, ]+)?(?:add|create|save) (?:a )?(?:study )?task(?: to)?\s+(.+)$",
+            r"^(?:maitri[, ]+)?add (?:a )?(?:study )?task(?: to)?\s+(.+)$",
             r"^(?:maitri[, ]+)?remind me to\s+(.+)$",
             r"^(?:maitri[, ]+)?add task\s*:\s*(.+)$",
             r"^(?:maitri[, ]+)?study task\s*:\s*(.+)$",
@@ -240,38 +249,99 @@ class MaitriApp:
                     detail = detail[:due_match.start()].strip()
                 if detail:
                     return "add_study_task", {"title": detail, "due": due}
-
         return None
 
     def call_mcp_tool(self, tool_name, arguments):
-        """Call the MCP bridge in the isolated MCP virtual environment."""
+        """Call the MCP server using its isolated virtual environment."""
         if not os.path.isfile(MCP_SERVER_PATH):
             raise FileNotFoundError(
-                "MCP server not found. Copy your Maitri_MCP_Starter folder beside app.py."
+                "MCP server not found. Keep maitri_mcp_server.py either beside app.py "
+                "or inside a Maitri_MCP_Starter subfolder."
             )
         if not os.path.isfile(MCP_PYTHON):
             raise FileNotFoundError(
-                "MCP virtual environment not found. Expected .venv\\\\Scripts\\\\python.exe "
-                "inside the Maitri_MCP_Starter folder."
+                "MCP Python not found. Expected .venv\\\\Scripts\\\\python.exe beside "
+                "maitri_mcp_server.py."
             )
         if not os.path.isfile(MCP_BRIDGE_PATH):
-            raise FileNotFoundError("maitri_mcp_bridge.py must be beside app.py.")
-        completed = subprocess.run(
+            raise FileNotFoundError("maitri_mcp_bridge.py is missing beside app.py.")
+        result = subprocess.run(
             [MCP_PYTHON, MCP_BRIDGE_PATH, tool_name, json.dumps(arguments, ensure_ascii=False)],
             cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True,
-            text=True,
-            timeout=60,
+            capture_output=True, text=True, timeout=60
         )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "Unknown MCP error").strip()
-            raise RuntimeError(detail)
-        return completed.stdout.strip()
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout or "Unknown MCP error").strip())
+        return result.stdout.strip()
+
+    def choose_mcp_tool_with_ollama(self, user_text):
+        """Ask local Ollama to select from a strict allowlist of MCP tools."""
+        tool_specs = [
+            {"name": "get_current_time", "description": "Get current local date and time.", "arguments": {}},
+            {"name": "add_study_task", "description": "Save a study task with optional due-time note.", "arguments": {"title": "task title", "due": "optional due note"}},
+            {"name": "list_study_tasks", "description": "List saved study tasks.", "arguments": {"include_completed": False}},
+            {"name": "complete_study_task", "description": "Mark a task complete by numeric ID.", "arguments": {"task_id": 1}}
+        ]
+        prompt = (
+            "Route the user's request to one available local MCP tool only if they clearly request an action. "
+            "For normal conversation, answer with {\\\"tool\\\":\\\"none\\\"}. Never invent task IDs. "
+            "For add_study_task, extract the task title and any due phrase as a plain note; do not guess dates. "
+            "Return only JSON, no markdown. Allowed tools and schemas: "
+            + json.dumps(tool_specs, ensure_ascii=False)
+            + "\\nExamples: 'what time is it' => {\\\"tool\\\":\\\"get_current_time\\\",\\\"arguments\\\":{}}; "
+              "'remind me to revise maths tomorrow' => {\\\"tool\\\":\\\"add_study_task\\\",\\\"arguments\\\":{\\\"title\\\":\\\"revise maths\\\",\\\"due\\\":\\\"tomorrow\\\"}}. "
+              "User request: " + user_text
+        )
+        payload = json.dumps({
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a strict tool intent router. Return only JSON and only choose tools from the allowlist."},
+                {"role": "user", "content": prompt}
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0}
+        }).encode("utf-8")
+        req = urllib.request.Request(OLLAMA_URL, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        try:
+            choice = json.loads(data.get("message", {}).get("content", ""))
+        except json.JSONDecodeError:
+            return None
+        name = choice.get("tool")
+        if name not in {"get_current_time", "add_study_task", "list_study_tasks", "complete_study_task", "none"} or name == "none":
+            return None
+        args = choice.get("arguments", {})
+        if not isinstance(args, dict):
+            return None
+        if name == "get_current_time":
+            args = {}
+        elif name == "add_study_task":
+            title, due = args.get("title"), args.get("due", "")
+            if not isinstance(title, str) or not title.strip() or len(title) > 300:
+                return None
+            if not isinstance(due, str) or len(due) > 150:
+                return None
+            args = {"title": title.strip(), "due": due.strip()}
+        elif name == "list_study_tasks":
+            args = {"include_completed": bool(args.get("include_completed", False))}
+        elif name == "complete_study_task":
+            task_id = args.get("task_id")
+            if not isinstance(task_id, int) or task_id < 1:
+                return None
+            args = {"task_id": task_id}
+        return name, args
 
     def ask_ollama(self):
         try:
             user_text = self.messages[-1].get("content", "") if self.messages else ""
-            tool_request = self.detect_mcp_command(user_text)
+            try:
+                tool_request = self.choose_mcp_tool_with_ollama(user_text)
+            except Exception:
+                tool_request = None
+            if tool_request is None:
+                tool_request = self.detect_mcp_command(user_text)
             if tool_request:
                 tool_name, arguments = tool_request
                 answer = self.call_mcp_tool(tool_name, arguments)
